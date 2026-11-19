@@ -323,6 +323,7 @@ impl CanvasSession {
     }
 
     /// DIPERTAHANKAN: dipakai fungsi lama lain, jangan dihapus.
+    #[allow(dead_code)]
     fn shared_palette_gif(
         &self,
         units: &[LayerId],
@@ -812,7 +813,7 @@ mod tests {
     }
 
     #[test]
-    fn [STRIPPED 73 bytes]() {
+    fn export_fps_curve_and_clamping() {
         assert_eq!(export_fps_at(0.0), 0.1);
         assert_eq!(export_fps_at(1.0), 60.0);
         for (fraction, fps) in [(0.125, 0.5), (0.25, 2.0), (0.375, 6.0), (0.5, 11.0), (0.56, 15.0), (0.75, 30.0)] {
