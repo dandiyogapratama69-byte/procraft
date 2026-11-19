@@ -1,6 +1,10 @@
 //! The layers as an animation: each visible top-level layer or group a frame, bottom first, as
 //! an animated GIF or PNG, or a frame at a time for a video or a preview. A background frame (the
 //! first) and a foreground frame (the last) don't play: they show with every frame that does.
+//!
+//! BARU - Clip model (Dreams / Krita style):
+//! 1 layer = 1 klip yang punya start_frame dan end_frame.
+//! Layer bisa hidup dari frame manapun sampai frame manapun, dan bisa digeser.
 
 use std::fs;
 use std::io::BufWriter;
@@ -13,6 +17,40 @@ use procraft_engine::formats::GifWriter;
 use crate::layers::ThumbnailImage;
 use crate::project::{file_error, thumbnail, write_atomically};
 use crate::{CanvasSession, MobileError};
+
+// BARU: 1 layer = 1 klip yang bisa digeser
+#[derive(Clone, Debug, PartialEq)]
+pub struct Clip {
+    pub layer: LayerId,
+    pub start_frame: i32,
+    pub end_frame: i32,
+}
+
+impl Clip {
+    pub fn new(layer: LayerId, start_frame: i32, end_frame: i32) -> Self {
+        Self { layer, start_frame: start_frame.max(0), end_frame: end_frame.max(start_frame) }
+    }
+    pub fn is_active_at(&self, frame: i32) -> bool {
+        frame >= self.start_frame && frame <= self.end_frame
+    }
+    pub fn move_by(&mut self, delta: i32) {
+        self.start_frame = (self.start_frame + delta).max(0);
+        self.end_frame = (self.end_frame + delta).max(self.start_frame);
+    }
+    pub fn trim_start(&mut self, new_start: i32) {
+        if new_start <= self.end_frame {
+            self.start_frame = new_start.max(0);
+        }
+    }
+    pub fn trim_end(&mut self, new_end: i32) {
+        if new_end >= self.start_frame {
+            self.end_frame = new_end;
+        }
+    }
+    pub fn extend_to_end(&mut self, total_frames: i32) {
+        self.end_frame = (total_frames - 1).max(self.start_frame);
+    }
+}
 
 /// How much of an animated GIF's frames is drawn at once (a frame to a core), so a big canvas's
 /// export doesn't hold many full-size frames.
@@ -52,8 +90,37 @@ fn timeline(doc: &Document) -> Vec<LayerId> {
 }
 
 /// The frames as they play: each frame that plays, as often as it is held.
+/// DIPERTAHANKAN biar fungsi lama di bawah tidak error.
 fn sequence(doc: &Document) -> Vec<LayerId> {
     held(doc, played(doc))
+}
+
+// BARU: Total frame dari jumlah layer (untuk tahap awal).
+// Nanti diganti dengan max end_frame dari clips yang tersimpan.
+fn total_frames(doc: &Document) -> i32 {
+    frames(doc).len() as i32
+}
+
+// BARU: Klip default dari layer-layer yang ada.
+// Layer ke-0 (background) hidup dari frame 0 sampai akhir, kayak Krita.
+// Layer lain sementara 1 frame, nanti bisa digeser di timeline.
+fn default_clips(doc: &Document) -> Vec<Clip> {
+    let all = frames(doc);
+    let total = total_frames(doc);
+    all.into_iter().enumerate().map(|(i, id)| {
+        let start = i as i32;
+        let end = if i == 0 { (total - 1).max(0) } else { start };
+        Clip::new(id, start, end)
+    }).collect()
+}
+
+// BARU: Layer apa saja yang tampil di frame `frame`.
+fn clips_for_frame(doc: &Document, frame: i32) -> Vec<LayerId> {
+    default_clips(doc)
+        .into_iter()
+        .filter(|c| c.is_active_at(frame))
+        .map(|c| c.layer)
+        .collect()
 }
 
 #[uniffi::export]
@@ -108,22 +175,33 @@ impl CanvasSession {
     }
 
     /// How many frames the animation plays (a background or foreground frame is not one of them).
+    /// BARU: sekarang = total frame dari model klip.
     pub fn animation_frame_count(&self) -> u32 {
-        u32::try_from(played(&self.shared.lock().doc).len()).unwrap_or(u32::MAX)
+        u32::try_from(total_frames(&self.shared.lock().doc)).unwrap_or(u32::MAX)
     }
 
-    /// Played frame `index` (bottom first) with a background frame under it and a foreground
-    /// frame over it, straight alpha, scaled to fit `max_side` (0: full size), over the background
-    /// unless `transparent`; none if there is no such frame.
+    /// BARU: Frame `index` = semua layer yang aktif di frame itu, bukan 1 layer lagi.
     pub fn animation_frame(&self, index: u32, transparent: bool, max_side: u32) -> Option<ThumbnailImage> {
-        let unit = played(&self.shared.lock().doc).get(usize::try_from(index).ok()?).copied()?;
-        match self.render_frame(unit, transparent, max_side) {
+        let frame = i32::try_from(index).ok()?;
+        match self.render_frame_at(frame, transparent, max_side) {
             Ok((width, height, rgba)) => Some(ThumbnailImage { width, height, rgba }),
             Err(e) => {
                 log::warn!("animation frame: {e}");
                 None
             }
         }
+    }
+
+    /// BARU: Untuk timeline Android - daftar klip: [layer_id, start, end, layer_id, start, end, ...]
+    pub fn animation_clips(&self) -> Vec<i64> {
+        let doc = self.shared.lock().doc.clone();
+        let mut out = Vec::new();
+        for c in default_clips(&doc) {
+            out.push(c.layer.0 as i64);
+            out.push(c.start_frame as i64);
+            out.push(c.end_frame as i64);
+        }
+        out
     }
 
     /// The animation as a looping GIF at `path`, `fps` frames a second, scaled to fit
@@ -140,26 +218,25 @@ impl CanvasSession {
         per_frame_palette: bool,
         transparent: bool,
     ) -> Result<(), MobileError> {
-        let units = sequence(&self.shared.lock().doc);
+        // BARU: export per frame index, bukan per layer
+        let total = total_frames(&self.shared.lock().doc);
+        let frame_indices: Vec<i32> = (0..total).collect();
         let delay = (100.0 / fps.clamp(0.1, 100.0)).round() as u16;
-        // the frames made take it to 0.95 (sharing a palette, its look at them to 0.45 first), the
-        // file written to 1
         self.exported(0.0);
+        // Untuk palette bersama, pakai render per-frame
         let (mut gif, start): (Option<GifWriter>, f32) = if per_frame_palette {
             (None, 0.0)
         } else {
-            (self.shared_palette_gif(&units, transparent, max_side)?, 0.45)
+            (self.shared_palette_gif_frames(&frame_indices, transparent, max_side)?, 0.45)
         };
-        // drawn a few at a time (a frame to a core, as many as fit in GIF_BATCH_BYTES), each few
-        // made into the GIF's frames side by side, then added in order
-        let mut next = 0;
-        let mut few = 1;
-        while next < units.len() {
-            let frames = units
+        let mut next = 0usize;
+        let mut few = 1usize;
+        while next < frame_indices.len() {
+            let frames = frame_indices
                 .iter()
                 .skip(next)
                 .take(few)
-                .map(|&unit| self.render_frame(unit, transparent, max_side))
+                .map(|&f| self.render_frame_at(f, transparent, max_side))
                 .collect::<Result<Vec<_>, _>>()?;
             next += frames.len();
             let Some(&(w, h, _)) = frames.first() else { break };
@@ -176,7 +253,7 @@ impl CanvasSession {
                 let frame = frame.unwrap_or_else(|| writer.encoded_frame(rgba, delay.max(1), dither));
                 writer.add_encoded(&frame);
             }
-            self.exported(start + (0.95 - start) * next as f32 / units.len() as f32);
+            self.exported(start + (0.95 - start) * next as f32 / frame_indices.len().max(1) as f32);
         }
         let bytes = gif.ok_or_else(|| file_error("saving", "there are no frames"))?.finish();
         write_atomically(Path::new(&path), |f| fs::write(f, &bytes).map_err(|e| file_error("saving", e)))?;
@@ -187,16 +264,15 @@ impl CanvasSession {
     /// The animation as a looping animated PNG at `path`, `fps` frames a second, scaled to fit
     /// `max_side` (0: full size), `transparent` leaving the background out.
     pub fn export_apng(&self, path: String, max_side: u32, fps: f32, transparent: bool) -> Result<(), MobileError> {
-        let units = sequence(&self.shared.lock().doc);
-        let count = u32::try_from(units.len()).unwrap_or(u32::MAX);
-        let Some((&first, rest)) = units.split_first() else {
+        let total = total_frames(&self.shared.lock().doc);
+        let frame_indices: Vec<i32> = (0..total).collect();
+        let count = u32::try_from(frame_indices.len()).unwrap_or(u32::MAX);
+        let Some((&first, rest)) = frame_indices.split_first() else {
             return Err(file_error("saving", "there are no frames"));
         };
-        // as the GIF's: the frames to 0.95, the file to 1
         self.exported(0.0);
         let made = |k: usize| self.exported(0.95 * k as f32 / count.max(1) as f32);
-        let (w, h, rgba) = self.render_frame(first, transparent, max_side)?;
-        // a frame lasts 1/fps seconds, in thousandths
+        let (w, h, rgba) = self.render_frame_at(first, transparent, max_side)?;
         let delay = (1000.0 / fps.clamp(0.1, 1000.0)).round().clamp(1.0, 65535.0) as u16;
         write_atomically(Path::new(&path), |f| {
             let out = fs::File::create(f).map_err(|e| file_error("saving", e))?;
@@ -209,8 +285,8 @@ impl CanvasSession {
             let mut writer = encoder.write_header().map_err(|e| file_error("saving", e))?;
             writer.write_image_data(&rgba).map_err(|e| file_error("saving", e))?;
             made(1);
-            for (k, &unit) in rest.iter().enumerate() {
-                let (fw, fh, frame) = self.render_frame(unit, transparent, max_side)?;
+            for (k, &frame_idx) in rest.iter().enumerate() {
+                let (fw, fh, frame) = self.render_frame_at(frame_idx, transparent, max_side)?;
                 if (fw, fh) != (w, h) {
                     return Err(file_error("saving", "the frames differ in size"));
                 }
@@ -225,18 +301,36 @@ impl CanvasSession {
 }
 
 impl CanvasSession {
-    /// A GIF writer whose frames share one palette, made from a sample of every frame's pixels
-    /// (each drawn once for it); none when there are no frames.
+    /// BARU: palette bersama dari frame-frame (bukan dari layer-layer)
+    fn shared_palette_gif_frames(
+        &self,
+        frames_idx: &[i32],
+        transparent: bool,
+        max_side: u32,
+    ) -> Result<Option<GifWriter>, MobileError> {
+        let per_frame = (GIF_PALETTE_SAMPLES / frames_idx.len().max(1)).max(256);
+        let mut samples: Vec<[u8; 4]> = Vec::new();
+        let mut size = None;
+        for (k, &f) in frames_idx.iter().enumerate() {
+            let (w, h, rgba) = self.render_frame_at(f, transparent, max_side)?;
+            size.get_or_insert((w, h));
+            let pixels = rgba.as_chunks::<4>().0;
+            let step = (pixels.len() / per_frame).max(1);
+            samples.extend(pixels.iter().step_by(step).filter(|p| p[3] >= 128));
+            self.exported(0.45 * (k + 1) as f32 / frames_idx.len() as f32);
+        }
+        Ok(size.map(|(w, h)| GifWriter::shared(w, h, &samples)))
+    }
+
+    /// DIPERTAHANKAN: dipakai fungsi lama lain, jangan dihapus.
     fn shared_palette_gif(
         &self,
         units: &[LayerId],
         transparent: bool,
         max_side: u32,
     ) -> Result<Option<GifWriter>, MobileError> {
-        // a held frame is drawn once, however many places it holds
         let mut seen = std::collections::HashSet::new();
         let units: Vec<LayerId> = units.iter().copied().filter(|u| seen.insert(*u)).collect();
-        // about as many sampled pixels in all as a single frame's palette looks at
         let per_frame = (GIF_PALETTE_SAMPLES / units.len().max(1)).max(256);
         let mut samples: Vec<[u8; 4]> = Vec::new();
         let mut size = None;
@@ -251,9 +345,54 @@ impl CanvasSession {
         Ok(size.map(|(w, h)| GifWriter::shared(w, h, &samples)))
     }
 
+    /// BARU: Render 1 frame = semua layer yang aktif di frame itu.
+    /// Ini inti dari perubahan Dreams / Krita.
+    fn render_frame_at(
+        &self,
+        frame: i32,
+        transparent: bool,
+        max_side: u32,
+    ) -> Result<(u32, u32, Vec<u8>), MobileError> {
+        let (w, h, rgba) = {
+            let mut guard = self.shared.lock();
+            let st = &mut *guard;
+            st.finish_stroke();
+            st.settle();
+            let mut doc = st.doc.clone();
+            // Layer yang aktif di frame ini + background/foreground yang selalu tampil
+            let active = clips_for_frame(&doc, frame);
+            let with = shown_with_each(&doc);
+            for id in doc.members(None) {
+                if !active.contains(&id) && !with.contains(&id) {
+                    doc.set_visible(id, false);
+                }
+            }
+            if transparent {
+                doc.background_visible = false;
+            }
+            let (w, h) = (doc.width(), doc.height());
+            let (Some(canvas), Some(gpu)) = (st.canvas.as_mut(), st.gpu.as_ref()) else {
+                return Err(file_error("reading the picture", "the canvas is not shown yet"));
+            };
+            let playing = canvas.play_frame();
+            canvas.set_play_frame(None);
+            canvas.invalidate();
+            canvas.render_finished(gpu, &mut doc);
+            let rgba = canvas.read_composite(gpu);
+            canvas.set_play_frame(playing);
+            canvas.invalidate();
+            canvas.render(gpu, &mut st.doc, None);
+            self.shared.frame(st);
+            (w, h, rgba.map_err(|e| file_error("reading the picture", e))?)
+        };
+        let side = if max_side == 0 { w.max(h) } else { max_side.min(w.max(h)) };
+        Ok(thumbnail(&rgba, w, h, side))
+    }
+
     /// `unit` with a background and a foreground frame and no other (the background too unless
     /// `transparent`), straight alpha, scaled to fit `max_side` (0: full size). The canvas shows
     /// the whole picture again afterwards.
+    /// DIPERTAHANKAN untuk kompatibilitas fungsi lama.
     fn render_frame(
         &self,
         unit: LayerId,
@@ -279,7 +418,6 @@ impl CanvasSession {
             let (Some(canvas), Some(gpu)) = (st.canvas.as_mut(), st.gpu.as_ref()) else {
                 return Err(file_error("reading the picture", "the canvas is not shown yet"));
             };
-            // drawn as playing shows it: the frame plain, not an onion skin of the current one
             let playing = canvas.play_frame();
             canvas.set_play_frame(frames(&doc).iter().position(|f| *f == unit));
             canvas.invalidate();
@@ -455,8 +593,6 @@ impl CanvasSession {
             let t = canvas.layer_picture(gpu, &mut st.doc, id, max_side).ok()?;
             return Some(ThumbnailImage { width: t.width, height: t.height, rgba: t.rgba });
         }
-        // a group's layers laid over one another at this size, with no regard to their blend
-        // modes: rendering the group alone would composite the whole canvas twice for each frame
         let mut picture: Option<ThumbnailImage> = None;
         for (layer, opacity) in showing_in(&st.doc, id, 1.0) {
             let t = canvas.layer_picture(gpu, &mut st.doc, layer, max_side).ok()?;
@@ -644,26 +780,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn clip_is_active_only_in_its_range() {
+        let c = Clip::new(LayerId(1), 5, 10);
+        assert!(!c.is_active_at(4));
+        assert!(c.is_active_at(5));
+        assert!(c.is_active_at(10));
+        assert!(!c.is_active_at(11));
+    }
+
+    #[test]
+    fn clip_moves_and_trims() {
+        let mut c = Clip::new(LayerId(1), 5, 10);
+        c.move_by(2);
+        assert_eq!((c.start_frame, c.end_frame), (7, 12));
+        c.trim_start(8);
+        assert_eq!(c.start_frame, 8);
+        c.trim_end(9);
+        assert_eq!(c.end_frame, 9);
+        c.extend_to_end(20);
+        assert_eq!(c.end_frame, 19);
+    }
+
+    #[test]
     fn a_layer_laid_over_keeps_what_shows_through_it() {
-        // half-covering red at half strength, over solid blue
         let mut under = [0, 0, 255, 255];
         lay_over(&mut under, &[128, 0, 0, 128], 0.5);
         assert_eq!(under, [64, 0, 191, 255]);
-        // over nothing it is itself
         let mut under = [0, 0, 0, 0];
         lay_over(&mut under, &[10, 20, 30, 40], 1.0);
         assert_eq!(under, [10, 20, 30, 40]);
     }
 
     #[test]
-    fn the_export_frame_rate_slider_goes_from_a_tenth_to_sixty_slow_at_the_start() {
+    fn [STRIPPED 73 bytes]() {
         assert_eq!(export_fps_at(0.0), 0.1);
         assert_eq!(export_fps_at(1.0), 60.0);
-        // as measured along it
         for (fraction, fps) in [(0.125, 0.5), (0.25, 2.0), (0.375, 6.0), (0.5, 11.0), (0.56, 15.0), (0.75, 30.0)] {
             assert!((export_fps_at(fraction) - fps).abs() < 1e-6, "{fraction}: {}", export_fps_at(fraction));
         }
-        // past the ends it stays at them
         assert_eq!(export_fps_at(-1.0), 0.1);
         assert_eq!(export_fps_at(2.0), 60.0);
         assert_eq!(export_fps_at(f32::NAN), 0.1);
@@ -671,7 +825,6 @@ mod tests {
 
     #[test]
     fn a_frame_rate_put_on_the_slider_reads_back_the_same() {
-        // the screen opens at the artwork's own rate
         for fps in [0.1, 0.3, 0.5, 0.9, 1.0, 2.0, 12.0, 15.0, 24.0, 30.0, 59.0, 60.0] {
             assert!((export_fps_at(export_fps_fraction(fps)) - fps).abs() < 1e-5, "{fps}");
         }
@@ -691,7 +844,6 @@ mod tests {
         assert_eq!(export_fps_label(60.0), "60");
         assert_eq!(export_fps_label(export_fps_at(0.125)), "0.5");
         assert_eq!(export_fps_label(export_fps_at(0.5)), "11");
-        // what is shown is what the file is made at
         for i in 0..=1000 {
             let fps = export_fps_at(i as f32 / 1000.0);
             assert_eq!(export_fps_label(fps).parse::<f32>().unwrap(), fps);
@@ -705,11 +857,9 @@ mod tests {
         assert_eq!(frame_rate(0.3), FrameRate { frames: 3, seconds: 10 });
         assert_eq!(frame_rate(15.0), FrameRate { frames: 15, seconds: 1 });
         assert_eq!(frame_rate(60.0), FrameRate { frames: 60, seconds: 1 });
-        // at 0.1 a frame lasts ten seconds, in 100 ns units
         let slow = frame_rate(0.1);
         assert_eq!(slow.time_of(1, 10_000_000), 100_000_000);
         assert_eq!(slow.time_of(7, 1_000_000), 70_000_000);
-        // no drift over many frames
         assert_eq!(frame_rate(0.3).time_of(3000, 1000), 10_000_000);
         assert_eq!(frame_rate(15.0).time_of(15, 1_000_000), 1_000_000);
         assert_eq!(frame_rate(0.0).seconds, 1000);
@@ -731,7 +881,6 @@ mod tests {
         assert_eq!(run(AnimationPlayback::Loop, 3, 6), [0, 1, 2, 0, 1, 2, 0]);
         assert_eq!(run(AnimationPlayback::PingPong, 3, 6), [0, 1, 2, 1, 0, 1, 2]);
         assert_eq!(run(AnimationPlayback::OneShot, 3, 6), [0, 1, 2]);
-        // one frame: looping shows it again and again; ping-pong and one shot stop
         assert_eq!(run(AnimationPlayback::Loop, 1, 2), [0, 0, 0]);
         assert_eq!(run(AnimationPlayback::PingPong, 1, 2), [0]);
         assert_eq!(animation_next_step(AnimationPlayback::Loop, 0, 0, 1), None);
