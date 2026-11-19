@@ -300,9 +300,12 @@ impl CanvasSession {
         if held.is_empty() {
             return Some(FramesInserted { added: 0, full });
         }
-        let assisted = self.shared.lock().doc.animation.as_ref().is_some_and(|a| !a.pages);
+        let assisted = {
+            let guard = self.shared.lock();
+            guard.doc.animation.as_ref().is_some_and(|a| !a.pages)
+        };
         if !assisted {
-            self.set_animation_assist(true);
+            let _ = self.set_animation_assist(true);
         }
         // each shown for as many of the animation's frames as its time takes, at the rate it has
         // now (turned on from Page Assist, its own)
